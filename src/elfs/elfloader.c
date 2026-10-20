@@ -958,6 +958,12 @@ int RelocateElf64(lib_t *maplib, lib_t *local_maplib, int bindnow, int deepbind,
         bindnow = 1;
         printf_log(LOG_DEBUG, "Forcing %s to Bind Now\n", head->name);
     }
+    if(head == my_context->elfs[0] && head->e_type==ET_DYN && !hasElfInterp(head)) {
+        // static-PIE main binary (no PT_INTERP), e.g. bionic's linker64 run directly: it relocates itself at start-up, a kernel
+        // does not pre-relocate it either; doing it here would apply the in-place (REL/RELR) addends twice
+        printf_log(LOG_DEBUG, "%s is a static PIE, leaving its relocations to the program\n", head->name);
+        return 0;
+    }
     if (!bindnow)
         SeedPltResolver64(head);
     if(head->relr) {

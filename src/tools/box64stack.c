@@ -122,13 +122,20 @@ void SetupInitialStack(x64emu_t *emu)
     elfheader_t* main = my_context->elfs[0];
     Push64(emu, 0); Push64(emu, 0);                         //AT_NULL(0)=0
     Push64(emu, main->fileno); Push64(emu, 2);   //AT_EXECFD=file desciptor of program
-    Push64(emu, (uintptr_t)main->PHEntries._64); Push64(emu, 3);                          //AT_PHDR(3)=address of the PH of the executable
+    // AT_PHDR must be the address of the program headers inside the mapped image (a loader such as bionic's linker64 run
+    // directly derives its own load bias from it); PHEntries is only box64's private copy
+    uintptr_t at_phdr = (uintptr_t)main->PHEntries._64;
+    for(size_t i=0; i<main->numPHEntries; ++i)
+        if(main->PHEntries._64[i].p_type==PT_PHDR) { at_phdr = (uintptr_t)(main->delta + main->PHEntries._64[i].p_vaddr); break; }
+    Push64(emu, at_phdr); Push64(emu, 3);                          //AT_PHDR(3)=address of the PH of the executable
     Push64(emu, sizeof(Elf64_Phdr)); Push64(emu, 4);                          //AT_PHENT(4)=size of PH entry
     Push64(emu, main->numPHEntries); Push64(emu, 5);                          //AT_PHNUM(5)=number of elf headers
     Push64(emu, X86_PAGE_SIZE); Push64(emu, 6);             //AT_PAGESZ(6)
     //Push64(emu, real_getauxval(7)); Push64(emu, 7);         //AT_BASE(7)=ld-2.27.so start (in memory)
     Push64(emu, 0); Push64(emu, 8);                         //AT_FLAGS(8)=0
-    Push64(emu, R_RIP); Push64(emu, 9);                     //AT_ENTRY(9)=entrypoint
+    // R_RIP is not set yet at this point; AT_ENTRY must be the real entry point (bionic's linker64 compares it with its own _start
+    // to know whether it was run directly)
+    Push64(emu, (uintptr_t)(main->entrypoint + main->delta)); Push64(emu, 9);                     //AT_ENTRY(9)=entrypoint
     Push64(emu, real_getauxval(11)); Push64(emu, 11);       //AT_UID(11)
     Push64(emu, real_getauxval(12)); Push64(emu, 12);       //AT_EUID(12)
     Push64(emu, real_getauxval(13)); Push64(emu, 13);       //AT_GID(13)
