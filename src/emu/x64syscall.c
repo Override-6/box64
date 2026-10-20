@@ -321,6 +321,8 @@ static const scwrap_t syscallwrap[] = {
     #ifdef NOALIGN
     [257] = {__NR_openat, 4},
     #endif
+    [310] = {__NR_process_vm_readv, 6},   // the iovec layout is the same on x86_64 and arm64; guest pointers are host pointers
+    [311] = {__NR_process_vm_writev, 6},
     [258] = {__NR_mkdirat, 3},
     [260] = {__NR_fchownat, 5},
     //[262] = {__NR_fstatat, 4},
@@ -607,6 +609,38 @@ static long clone_as_pthread(x64emu_t* emu, unsigned long flags, uintptr_t sp, i
     return tid;
 }
 
+// /proc/self/maps as the guest sees it. A raw openat() (bionic) reaches the kernel's file, which lists box64's own mappings; on a 48-bit
+// kernel many are above 2^47, an address range an x86_64 process cannot have, and guests that walk the file (the carve's key probe, allocators,
+// crash reporters) fault on them. Give the guest the x86_64-visible part only.
+static int is_self_maps(const char* path)
+{
+    if(!path || strncmp(path, "/proc/", 6)) return 0;
+    if(!strcmp(path, "/proc/self/maps")) return 1;
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "/proc/%d/maps", (int)getpid());
+    return !strcmp(path, tmp);
+}
+
+static int open_guest_maps(void)
+{
+    int fd = (int)syscall(__NR_memfd_create, "box64-maps", 0);
+    if(fd<0) return -errno;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if(!f) { close(fd); return -errno; }
+    char* line = NULL;
+    size_t len = 0;
+    while(getline(&line, &len, f)>0) {
+        uintptr_t start = 0;
+        if(sscanf(line, "%lx-", &start)==1 && start>=0x800000000000ULL) continue;
+        ssize_t dummy = write(fd, line, strlen(line));
+        (void)dummy;
+    }
+    free(line);
+    fclose(f);
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+
 void EXPORT x64Syscall(x64emu_t *emu)
 {
     // check if it's a wine process, then filter the syscall (simulate SECCMP)
@@ -646,6 +680,12 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         return;
     if (s == 157 && R_EDI == PR_SET_SYSCALL_USER_DISPATCH) {
         S_RAX = my_syscall_user_dispatch_prctl(emu, R_RSI, R_RDX, R_R10, (void*)R_R8);
+        return;
+    }
+    if((s==257 && (const char*)R_RSI && ((const char*)R_RSI)[0]=='/' && is_self_maps((const char*)R_RSI)) ||
+       (s==2 && is_self_maps((const char*)R_RDI))) {
+        S_RAX = open_guest_maps();
+        if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> 0x%x [guest view of /proc/self/maps]\n", S_EAX);
         return;
     }
     // check wrapper first
