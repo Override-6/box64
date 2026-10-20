@@ -23,6 +23,10 @@
 #include <sys/prctl.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
+#include <pthread.h>
+#include <limits.h>
+#include <linux/futex.h>
 
 #include "x64_signals.h"
 #include "os.h"
@@ -170,7 +174,6 @@ static const scwrap_t syscallwrap[] = {
     #endif
     //[58] = {__NR_vfork, 0},
     //[59] = {__NR_execve, 3},
-    [60] = {__NR_exit, 1},    // Needs wrapping?
     [61] = {__NR_wait4, 4},
     [62] = {__NR_kill, 2 },
     //[63] = {__NR_uname, 1}, // Needs wrapping, use old_utsname
@@ -530,6 +533,80 @@ static int clone_fn_syscall(void* arg)
     _exit(ret);
 }
 
+// A guest thread created with a raw clone(CLONE_VM|CLONE_THREAD...) (what bionic's pthread_create does) used to run on a host thread made
+// with clone() WITHOUT CLONE_SETTLS: that host thread shared its parent's host TLS block, so the child's thread_set_emu() replaced the
+// parent's emulator (pthread_setspecific), and errno / malloc's tcache were shared between two running threads. Use a real host pthread.
+typedef struct clone_pt_s {
+    x64emu_t* emu;
+    void* tls;
+    int set_tls;
+    int* ptid;
+    int* ctid;
+    unsigned long flags;
+    volatile int tid;
+} clone_pt_t;
+
+static __thread int clone_thread_active = 0;
+static __thread int clone_thread_exit_code = 0;
+
+static void* clone_pthread_fn(void* arg)
+{
+    clone_pt_t* a = arg;
+    x64emu_t* emu = a->emu;
+    void* tls = a->tls;
+    int set_tls = a->set_tls;
+    int* ctid = (a->flags & CLONE_CHILD_CLEARTID) ? a->ctid : NULL;
+    int tid = (int)syscall(__NR_gettid);
+    if(a->flags & CLONE_CHILD_SETTID) *a->ctid = tid;
+    if(a->flags & CLONE_PARENT_SETTID) *a->ptid = tid;
+    thread_set_emu(emu);    // own host TLS now: the emulator is released by the thread key destructor when this pthread ends
+    if(set_tls) SetFSBaseEmu(emu, tls);
+    R_RAX = 0;
+    clone_thread_active = 1;
+    // a (on the parent's stack) must not be touched after this point
+    __atomic_store_n(&a->tid, tid, __ATOMIC_RELEASE);
+    syscall(__NR_futex, &a->tid, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    DynaRun(emu);
+    if(ctid) {
+        // what the kernel does for CLONE_CHILD_CLEARTID (pthread_join waits on it); the guest may already have unmapped it, so no direct store
+        int zero = 0;
+        struct iovec l = {&zero, sizeof(zero)}, r = {ctid, sizeof(zero)};
+        process_vm_writev(getpid(), &l, 1, &r, 1, 0);
+        syscall(__NR_futex, ctid, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    }
+    return NULL;
+}
+
+static long clone_as_pthread(x64emu_t* emu, unsigned long flags, uintptr_t sp, int* ptid, int* ctid, uintptr_t tls)
+{
+    x64emu_t* newemu = NewX64Emu(emu->context, R_RIP, sp, 0, 0);
+    SetupX64Emu(newemu, emu);
+    CloneEmu(newemu, emu);
+    newemu->regs[_SP].q[0] = sp;
+    clone_pt_t a = {0};
+    a.emu = newemu;
+    a.tls = (void*)tls;
+    a.set_tls = (flags & CLONE_SETTLS) ? 1 : 0;
+    a.ptid = ptid;
+    a.ctid = ctid;
+    a.flags = flags;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 2*1024*1024);
+    pthread_t th;
+    int rc = pthread_create(&th, &attr, clone_pthread_fn, &a);
+    pthread_attr_destroy(&attr);
+    if(rc) {
+        FreeX64Emu(&newemu);
+        return -rc;
+    }
+    int tid;
+    while(!(tid = __atomic_load_n(&a.tid, __ATOMIC_ACQUIRE)))
+        syscall(__NR_futex, &a.tid, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    return tid;
+}
+
 void EXPORT x64Syscall(x64emu_t *emu)
 {
     // check if it's a wine process, then filter the syscall (simulate SECCMP)
@@ -754,10 +831,14 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         case 56: // sys_clone
             // x86_64 raw syscall is long clone(unsigned long flags, void *stack, int *parent_tid, int *child_tid, unsigned long tls);
             // so flags=R_RDI, stack=R_RSI, parent_tid=R_RDX, child_tid=R_R10, tls=R_R8
-            if ((R_EDI & CLONE_SETTLS) && R_R8 >= (0x800000000000ULL - X86_PAGE_SIZE)) {
+            if ((R_EDI & CLONE_SETTLS) && R_R8 >= (0x1000000000000ULL - X86_PAGE_SIZE)) {
                 // x86_64 kernel calls do_arch_prctl_64 in this case, which is the same case as my_arch_prctl.
                 // Refer to https://github.com/torvalds/linux/blob/v7.2/arch/x86/kernel/process_64.c#L904
                 S_RAX = -EPERM;
+                break;
+            }
+            if(R_RSI && (R_RDI & CLONE_VM) && (R_RDI & CLONE_THREAD)) {
+                S_RAX = clone_as_pthread(emu, R_RDI, R_RSI, (int*)R_RDX, (int*)R_R10, R_R8);
                 break;
             }
             if((R_EDI&~0xff)==0x4100) {
@@ -965,6 +1046,14 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                     memcpy((void*)R_RDX, new_mask, R_ESI);
                 }
             }
+            break;
+        case 60:    // sys_exit: ends the calling thread only
+            if(clone_thread_active) {
+                clone_thread_exit_code = S_EDI;
+                emu->quit = 1;
+                break;
+            }
+            S_RAX = syscall(__NR_exit, R_RDI);
             break;
         case 231:   // sys_exit_group
             my__exit(emu, S_EDI);
